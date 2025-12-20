@@ -35,6 +35,12 @@ jobs:
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
           DIFF_JSON=$(cat "${{ steps.diff.outputs.saved_diff }}" | jq -Rs .)
+          RULES_MD=$(cat <<'EOF' | jq -Rs .
+          ## Workflow / CI Rules
+          - Do NOT flag GitHub Actions secrets references like `${{ secrets.DIFF_SHERIFF_TOKEN }}` as "hardcoded" or "exposed".
+          - Only flag secrets if a literal token value is committed in plaintext.
+          EOF
+          )
 
           RESPONSE=$(curl -sS -X POST "$DIFF_SHERIFF_URL/review" \
             -H "Authorization: Bearer $DIFF_SHERIFF_TOKEN" \
@@ -45,8 +51,9 @@ jobs:
               \"repo\": \"${{ github.repository }}\",
               \"prNumber\": ${{ github.event.pull_request.number }},
               \"sha\": \"${{ github.event.pull_request.head.sha }}\",
-              \"title\": $(printf %s "$PR_TITLE" | jq -Rs .),
-              \"description\": $(printf %s "$PR_BODY" | jq -Rs .),
+              \"title\": $(printf %s \"$PR_TITLE\" | jq -Rs .),
+              \"description\": $(printf %s \"$PR_BODY\" | jq -Rs .),
+              \"rulesMd\": $RULES_MD,
               \"mode\": \"summary\"
             }")
 
@@ -55,14 +62,19 @@ jobs:
           echo "$RESPONSE" >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
 
-      - name: Comment on PR with review JSON
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const body = `Diff-Sheriff review (JSON):\n\n\`\`\`json\n${{ steps.sheriff.outputs.response }}\n\`\`\`\n`;
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body
-            });
+      - name: Post review as PR comment
+        env:
+          RESPONSE: ${{ steps.sheriff.outputs.response }}
+        run: |
+          COMMENT_MD=$(echo "$RESPONSE" | jq -r '.commentMd // empty')
+          if [ -z "$COMMENT_MD" ]; then
+            echo "No commentMd in response, skipping comment"
+            exit 0
+          fi
+          # Post the markdown comment using GitHub API
+          jq -n --arg body "$COMMENT_MD" '{body: $body}' | \
+          curl -sS -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
+            -d @-

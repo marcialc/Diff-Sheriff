@@ -84,7 +84,7 @@ Authenticated endpoint that reviews a code diff.
 {
   "ok": true,
   "reviewId": "uuid",
-  "summary": "Brief overall assessment",
+  "summary": "Brief overall assessment (2-4 sentences)",
   "findings": [
     {
       "severity": "high | medium | low | nit",
@@ -95,6 +95,8 @@ Authenticated endpoint that reviews a code diff.
       "line": 42
     }
   ],
+  "commentMd": "<!-- diff-sheriff -->\n## ✅ Diff-Sheriff Review\n...",
+  "recommendation": "approve | approve_with_changes | request_changes",
   "meta": {
     "provider": "github",
     "repo": "owner/repo",
@@ -104,6 +106,43 @@ Authenticated endpoint that reviews a code diff.
   }
 }
 ```
+
+### Markdown Comment Format
+
+The `commentMd` field contains a pre-rendered Markdown comment suitable for posting directly to GitHub/GitLab PRs. The format follows a senior engineer review style:
+
+```markdown
+<!-- diff-sheriff -->
+## ✅ Diff-Sheriff Review
+
+### 🔎 Summary
+> 2-4 sentence high-level assessment.
+
+### 🚨 Must Fix (Blocking)
+- **Issue title** (`file.ts`:42) — rationale. *Suggestion:* how to fix.
+
+### ⚠️ Should Fix (Recommended)
+- Bullets for medium-severity items.
+
+### 💡 Nice to Have (Optional)
+- Bullets for low/nit items.
+
+### 🧪 Testing Notes
+- Testing suggestions if relevant.
+
+### 🧭 Overall Recommendation
+- **Approve** / **Approve with changes** / **Request changes** — justification.
+
+<sub>Reviewed by Diff-Sheriff • AI-assisted, human-aligned • Commit: `abc1234`</sub>
+```
+
+Empty sections are automatically omitted. The `<!-- diff-sheriff -->` marker enables deduplication in CI workflows.
+
+### Recommendation Logic
+
+- `request_changes` — if any **high** severity findings
+- `approve_with_changes` — if any **medium** severity findings
+- `approve` — otherwise
 
 **Error Responses:**
 - `401` - Unauthorized (missing/invalid token)

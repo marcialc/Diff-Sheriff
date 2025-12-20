@@ -25,11 +25,15 @@ interface Finding {
   line?: number;
 }
 
+type Recommendation = "approve" | "approve_with_changes" | "request_changes";
+
 interface ReviewResponse {
   ok: true;
   reviewId: string;
   summary: string;
   findings: Finding[];
+  commentMd: string;
+  recommendation: Recommendation;
   meta: {
     provider?: string;
     repo?: string;
@@ -47,18 +51,30 @@ interface ErrorResponse {
 const MAX_DIFF_LENGTH = 60_000;
 const AI_MODEL = "@cf/meta/llama-3.1-8b-instruct-fp8";
 
-const SYSTEM_PROMPT = `You are Diff-Sheriff, an expert code reviewer. Your job is to review code diffs and provide actionable feedback.
+const SYSTEM_PROMPT = `You are Diff-Sheriff, a senior/lead engineer conducting a thorough PR review. Your job is to review code diffs and provide actionable, high-signal feedback.
+
+Priorities (in order):
+1. Correctness — bugs, logic errors, edge cases
+2. Security — vulnerabilities, data exposure, injection risks
+3. Maintainability — clarity, testability, future-proofing
+4. Performance — only if clearly impactful
 
 Rules:
 - Only comment on code visible in the diff or its immediate context.
-- Be concise and specific.
-- Focus on bugs, security issues, performance problems, and code quality.
-- Do not comment on code style unless it impacts readability significantly.
+- Be concise and specific. Avoid nitpicks unless they matter.
+- Do NOT flag GitHub Actions secrets references like \`\${{ secrets.* }}\` as hardcoded secrets.
+- Do NOT comment on code style unless it significantly impacts readability.
 - Output ONLY valid JSON matching the schema below. No markdown, no explanations outside JSON.
+
+Severity guide:
+- high: Bugs, security issues, data loss risks — must fix before merge
+- medium: Logic issues, missing validation, poor error handling — should fix
+- low: Minor improvements, edge cases, clarity — nice to have
+- nit: Trivial suggestions — only include if truly valuable
 
 Output JSON Schema:
 {
-  "summary": "string - Brief overall assessment (1-3 sentences)",
+  "summary": "string - 2-4 sentence high-level assessment as a senior engineer would write",
   "findings": [
     {
       "severity": "high" | "medium" | "low" | "nit",
@@ -68,14 +84,106 @@ Output JSON Schema:
       "file": "string (optional) - File path if identifiable",
       "line": "number (optional) - Line number if identifiable"
     }
-  ]
+  ],
+  "testingNotes": ["string (optional) - 1-3 testing suggestions if relevant"]
 }
 
 If the diff looks good with no issues, return:
 {
   "summary": "Code looks good. No significant issues found.",
-  "findings": []
+  "findings": [],
+  "testingNotes": []
 }`;
+
+function deriveRecommendation(findings: Finding[]): Recommendation {
+  const hasHigh = findings.some((f) => f.severity === "high");
+  const hasMedium = findings.some((f) => f.severity === "medium");
+  if (hasHigh) return "request_changes";
+  if (hasMedium) return "approve_with_changes";
+  return "approve";
+}
+
+function renderReviewMarkdown(
+  summary: string,
+  findings: Finding[],
+  testingNotes: string[],
+  recommendation: Recommendation,
+  sha?: string
+): string {
+  const lines: string[] = [];
+
+  lines.push("<!-- diff-sheriff -->");
+  lines.push("## ✅ Diff-Sheriff Review");
+  lines.push("");
+
+  lines.push("### 🔎 Summary");
+  lines.push(`> ${summary}`);
+  lines.push("");
+
+  const high = findings.filter((f) => f.severity === "high");
+  const medium = findings.filter((f) => f.severity === "medium");
+  const lowAndNit = findings.filter((f) => f.severity === "low" || f.severity === "nit");
+
+  if (high.length > 0) {
+    lines.push("### 🚨 Must Fix (Blocking)");
+    for (const f of high) {
+      lines.push(formatFindingBullet(f));
+    }
+    lines.push("");
+  }
+
+  if (medium.length > 0) {
+    lines.push("### ⚠️ Should Fix (Recommended)");
+    for (const f of medium) {
+      lines.push(formatFindingBullet(f));
+    }
+    lines.push("");
+  }
+
+  if (lowAndNit.length > 0) {
+    lines.push("### 💡 Nice to Have (Optional)");
+    for (const f of lowAndNit) {
+      lines.push(formatFindingBullet(f));
+    }
+    lines.push("");
+  }
+
+  if (testingNotes.length > 0) {
+    lines.push("### 🧪 Testing Notes");
+    for (const note of testingNotes) {
+      lines.push(`- ${note}`);
+    }
+    lines.push("");
+  }
+
+  lines.push("### 🧭 Overall Recommendation");
+  const recText = recommendation === "approve"
+    ? "**Approve** — No blocking issues found."
+    : recommendation === "approve_with_changes"
+    ? "**Approve with changes** — Address the recommended items before or shortly after merge."
+    : "**Request changes** — Blocking issues must be resolved before merge.";
+  lines.push(`- ${recText}`);
+  lines.push("");
+
+  const commitRef = sha ? `\`${sha.slice(0, 7)}\`` : "N/A";
+  lines.push(`<sub>Reviewed by Diff-Sheriff • AI-assisted, human-aligned • Commit: ${commitRef}</sub>`);
+
+  return lines.join("\n");
+}
+
+function formatFindingBullet(f: Finding): string {
+  let bullet = `- **${f.title}**`;
+  if (f.file) {
+    bullet += ` (\`${f.file}\``;
+    if (f.line) bullet += `:${f.line}`;
+    bullet += ")";
+  }
+  bullet += ` — ${f.rationale}`;
+  if (f.suggestion) {
+    bullet += ` *Suggestion:* ${f.suggestion}`;
+  }
+  return bullet;
+}
 
 function buildUserPrompt(req: ReviewRequest, truncated: boolean): string {
   const parts: string[] = [];
@@ -147,6 +255,7 @@ function validateFinding(f: unknown): Finding | null {
 function validateAiResponse(parsed: unknown): {
   summary: string;
   findings: Finding[];
+  testingNotes: string[];
 } {
   if (typeof parsed !== "object" || parsed === null) {
     throw new Error("AI response is not an object");
@@ -168,9 +277,19 @@ function validateAiResponse(parsed: unknown): {
     }
   }
 
+  const testingNotes: string[] = [];
+  if (Array.isArray(obj.testingNotes)) {
+    for (const note of obj.testingNotes) {
+      if (typeof note === "string" && note.trim()) {
+        testingNotes.push(note.trim());
+      }
+    }
+  }
+
   return {
     summary: obj.summary,
     findings,
+    testingNotes,
   };
 }
 
@@ -265,7 +384,7 @@ async function handleReview(
     return errorResponse(`AI failure: ${message}`, 500);
   }
 
-  let validated: { summary: string; findings: Finding[] };
+  let validated: { summary: string; findings: Finding[]; testingNotes: string[] };
   try {
     const parsed = extractJson(aiResponseText);
     validated = validateAiResponse(parsed);
@@ -274,11 +393,22 @@ async function handleReview(
     return errorResponse(`AI response parsing failed: ${message}`, 500);
   }
 
+  const recommendation = deriveRecommendation(validated.findings);
+  const commentMd = renderReviewMarkdown(
+    validated.summary,
+    validated.findings,
+    validated.testingNotes,
+    recommendation,
+    reviewReq.sha
+  );
+
   const response: ReviewResponse = {
     ok: true,
     reviewId: crypto.randomUUID(),
     summary: validated.summary,
     findings: validated.findings,
+    commentMd,
+    recommendation,
     meta: {
       provider: reviewReq.provider,
       repo: reviewReq.repo,
