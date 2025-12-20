@@ -27,6 +27,7 @@ interface Finding {
 
 type Recommendation = "approve" | "approve_with_changes" | "request_changes";
 
+// Response from Human
 interface ReviewResponse {
   ok: true;
   reviewId: string;
