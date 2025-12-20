@@ -61,10 +61,12 @@ Priorities (in order):
 4. Performance — only if clearly impactful
 
 Rules:
-- Only comment on code visible in the diff or its immediate context.
-- Be concise and specific. Avoid nitpicks unless they matter.
+- ONLY comment on actual code changes visible in the diff. Do NOT invent feedback.
+- Do NOT comment on missing PR title, description, or other metadata. Do NOT give process feedback.
 - Do NOT flag GitHub Actions secrets references like \`\${{ secrets.* }}\` as hardcoded secrets.
 - Do NOT comment on code style unless it significantly impacts readability.
+- Be concise and specific. Avoid nitpicks unless they matter.
+- If the diff only contains comments, whitespace, or trivial changes with no functional impact, return an empty findings array.
 - Output ONLY valid JSON matching the schema below. No markdown, no explanations outside JSON.
 
 Severity guide:
@@ -75,7 +77,7 @@ Severity guide:
 
 Output JSON Schema:
 {
-  "summary": "string - 2-4 sentence high-level assessment as a senior engineer would write",
+  "summary": "string - 2-4 sentence high-level assessment of the actual code changes",
   "findings": [
     {
       "severity": "high" | "medium" | "low" | "nit",
@@ -253,6 +255,49 @@ function validateFinding(f: unknown): Finding | null {
   return finding;
 }
 
+const METADATA_NOISE_PATTERNS = [
+  /\bpr\s+title\b/i,
+  /\bpr\s+description\b/i,
+  /\bmissing\s+(title|description|context)\b/i,
+  /\black\s+of\s+(context|description)\b/i,
+  /\bempty\s+(title|description)\b/i,
+  /\bno\s+(title|description|context)\b/i,
+  /\bprovide\s+(a\s+)?(clear\s+)?(title|description)\b/i,
+];
+
+function isMetadataNoiseFinding(finding: Finding): boolean {
+  const text = `${finding.title} ${finding.rationale} ${finding.suggestion || ""}`.toLowerCase();
+  return METADATA_NOISE_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+function filterNonsensicalFindings(findings: Finding[]): Finding[] {
+  return findings.filter((f) => !isMetadataNoiseFinding(f));
+}
+
+function isTrivialDiff(diff: string): boolean {
+  const lines = diff.split("\n");
+  let hasSubstantiveChange = false;
+
+  for (const line of lines) {
+    if (!line.startsWith("+") && !line.startsWith("-")) continue;
+    if (line.startsWith("+++") || line.startsWith("---")) continue;
+
+    const content = line.slice(1).trim();
+    if (!content) continue;
+
+    if (content.startsWith("//") || content.startsWith("#") || content.startsWith("*") || content.startsWith("/*") || content.startsWith("*/")) {
+      continue;
+    }
+
+    if (/^\s*$/.test(content)) continue;
+
+    hasSubstantiveChange = true;
+    break;
+  }
+
+  return !hasSubstantiveChange;
+}
+
 function validateAiResponse(parsed: unknown): {
   summary: string;
   findings: Finding[];
@@ -364,6 +409,32 @@ async function handleReview(
     truncatedDiff = true;
   }
 
+  if (isTrivialDiff(reviewReq.diff)) {
+    const trivialSummary = "Trivial change (comments, whitespace, or non-functional). No issues found.";
+    const trivialCommentMd = renderReviewMarkdown(
+      trivialSummary,
+      [],
+      [],
+      "approve",
+      reviewReq.sha
+    );
+    return jsonResponse({
+      ok: true,
+      reviewId: crypto.randomUUID(),
+      summary: trivialSummary,
+      findings: [],
+      commentMd: trivialCommentMd,
+      recommendation: "approve",
+      meta: {
+        provider: reviewReq.provider,
+        repo: reviewReq.repo,
+        sha: reviewReq.sha,
+        mode: reviewReq.mode || "summary",
+        truncatedDiff,
+      },
+    } satisfies ReviewResponse);
+  }
+
   const userPrompt = buildUserPrompt(reviewReq, truncatedDiff);
 
   let aiResponseText: string;
@@ -394,10 +465,11 @@ async function handleReview(
     return errorResponse(`AI response parsing failed: ${message}`, 500);
   }
 
-  const recommendation = deriveRecommendation(validated.findings);
+  const filteredFindings = filterNonsensicalFindings(validated.findings);
+  const recommendation = deriveRecommendation(filteredFindings);
   const commentMd = renderReviewMarkdown(
     validated.summary,
-    validated.findings,
+    filteredFindings,
     validated.testingNotes,
     recommendation,
     reviewReq.sha
@@ -407,7 +479,7 @@ async function handleReview(
     ok: true,
     reviewId: crypto.randomUUID(),
     summary: validated.summary,
-    findings: validated.findings,
+    findings: filteredFindings,
     commentMd,
     recommendation,
     meta: {
