@@ -472,14 +472,19 @@ async function handleReview(
 
   const userPrompt = buildUserPrompt(reviewReq, truncatedDiff);
 
+  const strictUserPrompt = `${userPrompt}\n\nIMPORTANT: Return ONLY a single valid JSON object (double quotes for keys/strings). No markdown, no code fences, no commentary.`;
+
   let aiResponseText: string;
   try {
-    const aiResponse = await env.AI.run(AI_MODEL, {
+    const aiInput: Record<string, unknown> = {
       input: [
         { role: "system", content: SYSTEM_PROMPT },
-        { role: "user", content: userPrompt },
+        { role: "user", content: strictUserPrompt },
       ],
-    });
+      response_format: { type: "json_object" },
+    };
+
+    const aiResponse = await env.AI.run(AI_MODEL, aiInput as never);
 
     aiResponseText = getAiResponseText(aiResponse);
   } catch (err) {
@@ -492,8 +497,28 @@ async function handleReview(
     const parsed = extractJson(aiResponseText);
     validated = validateAiResponse(parsed);
   } catch (err) {
-    const message = err instanceof Error ? err.message : "Failed to parse AI response";
-    return errorResponse(`AI response parsing failed: ${message}`, 500);
+    try {
+      const retryInput: Record<string, unknown> = {
+        input: [
+          { role: "system", content: SYSTEM_PROMPT },
+          {
+            role: "user",
+            content:
+              `${strictUserPrompt}\n\nYour previous response was not valid JSON. Try again and output ONLY valid JSON.`,
+          },
+        ],
+        response_format: { type: "json_object" },
+      };
+
+      const retryResp = await env.AI.run(AI_MODEL, retryInput as never);
+      const retryText = getAiResponseText(retryResp);
+      const parsed = extractJson(retryText);
+      validated = validateAiResponse(parsed);
+    } catch (retryErr) {
+      const message =
+        retryErr instanceof Error ? retryErr.message : "Failed to parse AI response";
+      return errorResponse(`AI response parsing failed: ${message}`, 500);
+    }
   }
 
   const filteredFindings = filterNonsensicalFindings(validated.findings);
