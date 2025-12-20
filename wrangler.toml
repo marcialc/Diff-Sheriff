@@ -1,0 +1,14 @@
+# Diff-Sheriff - PR Reviewer Service
+# https://developers.cloudflare.com/workers/
+
+name = "diff-sheriff"
+main = "src/index.ts"
+compatibility_date = "2025-12-20"
+
+# Workers AI binding
+[ai]
+binding = "AI"
+
+# AUTH_TOKEN must be set as a secret:
+# wrangler secret put AUTH_TOKEN
+# This token is used for Bearer authentication on /review endpoint
