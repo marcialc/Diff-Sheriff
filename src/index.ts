@@ -27,12 +27,19 @@ interface Finding {
 
 type Recommendation = "approve" | "approve_with_changes" | "request_changes";
 
+interface InlineComment {
+  path: string;
+  line: number;
+  body: string;
+}
+
 interface ReviewResponse {
   ok: true;
   reviewId: string;
   summary: string;
   findings: Finding[];
   commentMd: string;
+  inlineComments: InlineComment[];
   recommendation: Recommendation;
   meta: {
     provider?: string;
@@ -175,6 +182,28 @@ function formatFindingBullet(f: Finding): string {
     bullet += ` → ${f.suggestion}`;
   }
   return bullet;
+}
+
+function buildInlineComments(findings: Finding[]): InlineComment[] {
+  const comments: InlineComment[] = [];
+  
+  for (const f of findings) {
+    if (!f.file || !f.line) continue;
+    
+    const severityEmoji = f.severity === "high" ? "🚨" : f.severity === "medium" ? "⚠️" : "💡";
+    let body = `${severityEmoji} **${f.title}**\n\n${f.rationale}`;
+    if (f.suggestion) {
+      body += `\n\n**Suggestion:** ${f.suggestion}`;
+    }
+    
+    comments.push({
+      path: f.file,
+      line: f.line,
+      body,
+    });
+  }
+  
+  return comments;
 }
 
 function buildUserPrompt(req: ReviewRequest, truncated: boolean): string {
@@ -404,6 +433,7 @@ async function handleReview(
     recommendation,
     reviewReq.sha
   );
+  const inlineComments = buildInlineComments(validated.findings);
 
   const response: ReviewResponse = {
     ok: true,
@@ -411,6 +441,7 @@ async function handleReview(
     summary: validated.summary,
     findings: validated.findings,
     commentMd,
+    inlineComments,
     recommendation,
     meta: {
       provider: reviewReq.provider,

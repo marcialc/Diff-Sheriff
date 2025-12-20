@@ -62,19 +62,51 @@ jobs:
           echo "$RESPONSE" >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
 
-      - name: Post review as PR comment
+      - name: Post PR review with inline comments
+        uses: actions/github-script@v7
         env:
           RESPONSE: ${{ steps.sheriff.outputs.response }}
-        run: |
-          COMMENT_MD=$(echo "$RESPONSE" | jq -r '.commentMd // empty')
-          if [ -z "$COMMENT_MD" ]; then
-            echo "No commentMd in response, skipping comment"
-            exit 0
-          fi
-          # Post the markdown comment using GitHub API
-          jq -n --arg body "$COMMENT_MD" '{body: $body}' | \
-          curl -sS -X POST \
-            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
-            -d @-
+        with:
+          script: |
+            const response = JSON.parse(process.env.RESPONSE);
+            if (!response.ok) {
+              console.log('Review failed:', response.error);
+              return;
+            }
+            
+            const { summary, recommendation, inlineComments, commentMd } = response;
+            
+            // Map recommendation to GitHub review event
+            const event = recommendation === 'approve' ? 'APPROVE' 
+              : recommendation === 'request_changes' ? 'REQUEST_CHANGES' 
+              : 'COMMENT';
+            
+            // Build review comments for inline feedback
+            const comments = (inlineComments || []).map(c => ({
+              path: c.path,
+              line: c.line,
+              body: c.body
+            }));
+            
+            try {
+              await github.rest.pulls.createReview({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.payload.pull_request.number,
+                commit_id: context.payload.pull_request.head.sha,
+                body: commentMd,
+                event: event,
+                comments: comments
+              });
+              console.log(`Posted review with ${comments.length} inline comments`);
+            } catch (err) {
+              console.error('Failed to post review:', err.message);
+              // Fallback: post as regular comment if review fails
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body: commentMd
+              });
+              console.log('Posted as regular comment instead');
+            }
