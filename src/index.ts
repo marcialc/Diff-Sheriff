@@ -27,12 +27,19 @@ interface Finding {
 
 type Recommendation = "approve" | "approve_with_changes" | "request_changes";
 
+interface InlineComment {
+  path: string;
+  line: number;
+  body: string;
+}
+
 interface ReviewResponse {
   ok: true;
   reviewId: string;
   summary: string;
   findings: Finding[];
   commentMd: string;
+  inlineComments: InlineComment[];
   recommendation: Recommendation;
   meta: {
     provider?: string;
@@ -49,7 +56,7 @@ interface ErrorResponse {
 }
 
 const MAX_DIFF_LENGTH = 60_000;
-const AI_MODEL = "@cf/meta/llama-3.1-8b-instruct-fp8";
+const AI_MODEL = "@cf/qwen/qwen3-30b-a3b-fp8";
 
 const SYSTEM_PROMPT = `You are Diff-Sheriff, a senior/lead engineer conducting a thorough PR review. Your job is to review code diffs and provide actionable, high-signal feedback.
 
@@ -113,11 +120,11 @@ function renderReviewMarkdown(
   const lines: string[] = [];
 
   lines.push("<!-- diff-sheriff -->");
-  lines.push("## ✅ Diff-Sheriff Review");
+  
+  const recEmoji = recommendation === "approve" ? "✅" : recommendation === "approve_with_changes" ? "⚠️" : "❌";
+  lines.push(`## ${recEmoji} Diff-Sheriff`);
   lines.push("");
-
-  lines.push("### 🔎 Summary");
-  lines.push(`> ${summary}`);
+  lines.push(`${summary}`);
   lines.push("");
 
   const high = findings.filter((f) => f.severity === "high");
@@ -125,7 +132,7 @@ function renderReviewMarkdown(
   const lowAndNit = findings.filter((f) => f.severity === "low" || f.severity === "nit");
 
   if (high.length > 0) {
-    lines.push("### 🚨 Must Fix (Blocking)");
+    lines.push("**🚨 Blocking**");
     for (const f of high) {
       lines.push(formatFindingBullet(f));
     }
@@ -133,7 +140,7 @@ function renderReviewMarkdown(
   }
 
   if (medium.length > 0) {
-    lines.push("### ⚠️ Should Fix (Recommended)");
+    lines.push("**⚠️ Should Fix**");
     for (const f of medium) {
       lines.push(formatFindingBullet(f));
     }
@@ -141,7 +148,7 @@ function renderReviewMarkdown(
   }
 
   if (lowAndNit.length > 0) {
-    lines.push("### 💡 Nice to Have (Optional)");
+    lines.push("**💡 Optional**");
     for (const f of lowAndNit) {
       lines.push(formatFindingBullet(f));
     }
@@ -149,40 +156,54 @@ function renderReviewMarkdown(
   }
 
   if (testingNotes.length > 0) {
-    lines.push("### 🧪 Testing Notes");
+    lines.push("**🧪 Test**");
     for (const note of testingNotes) {
       lines.push(`- ${note}`);
     }
     lines.push("");
   }
 
-  lines.push("### 🧭 Overall Recommendation");
-  const recText = recommendation === "approve"
-    ? "**Approve** — No blocking issues found."
-    : recommendation === "approve_with_changes"
-    ? "**Approve with changes** — Address the recommended items before or shortly after merge."
-    : "**Request changes** — Blocking issues must be resolved before merge.";
-  lines.push(`- ${recText}`);
-  lines.push("");
-
-  const commitRef = sha ? `\`${sha.slice(0, 7)}\`` : "N/A";
-  lines.push(`<sub>Reviewed by Diff-Sheriff • AI-assisted, human-aligned • Commit: ${commitRef}</sub>`);
+  const commitRef = sha ? sha.slice(0, 7) : "";
+  lines.push(`<sub>${commitRef}</sub>`);
 
   return lines.join("\n");
 }
 
 function formatFindingBullet(f: Finding): string {
-  let bullet = `- **${f.title}**`;
+  let loc = "";
   if (f.file) {
-    bullet += ` (\`${f.file}\``;
-    if (f.line) bullet += `:${f.line}`;
-    bullet += ")";
+    loc = f.line ? `\`${f.file}:${f.line}\`` : `\`${f.file}\``;
   }
-  bullet += ` — ${f.rationale}`;
+  
+  let bullet = `- **${f.title}**`;
+  if (loc) bullet += ` ${loc}`;
+  bullet += `: ${f.rationale}`;
   if (f.suggestion) {
-    bullet += ` *Suggestion:* ${f.suggestion}`;
+    bullet += ` → ${f.suggestion}`;
   }
   return bullet;
+}
+
+function buildInlineComments(findings: Finding[]): InlineComment[] {
+  const comments: InlineComment[] = [];
+  
+  for (const f of findings) {
+    if (!f.file || !f.line) continue;
+    
+    const severityEmoji = f.severity === "high" ? "🚨" : f.severity === "medium" ? "⚠️" : "💡";
+    let body = `${severityEmoji} **${f.title}**\n\n${f.rationale}`;
+    if (f.suggestion) {
+      body += `\n\n**Suggestion:** ${f.suggestion}`;
+    }
+    
+    comments.push({
+      path: f.file,
+      line: f.line,
+      body,
+    });
+  }
+  
+  return comments;
 }
 
 function buildUserPrompt(req: ReviewRequest, truncated: boolean): string {
@@ -374,8 +395,19 @@ async function handleReview(
       ],
     });
 
-    if (typeof aiResponse === "object" && aiResponse !== null && "response" in aiResponse) {
-      aiResponseText = String((aiResponse as { response: unknown }).response);
+    if (typeof aiResponse === "object" && aiResponse !== null) {
+      const obj = aiResponse as Record<string, unknown>;
+      if ("choices" in obj && Array.isArray(obj.choices) && obj.choices.length > 0) {
+        const choice = obj.choices[0] as Record<string, unknown>;
+        const message = choice.message as Record<string, unknown> | undefined;
+        if (message && typeof message.content === "string") {
+          aiResponseText = message.content;
+        } else {
+          throw new Error("No content in choices[0].message");
+        }
+      } else {
+        throw new Error(`Unexpected AI response format: ${JSON.stringify(Object.keys(obj))}`);
+      }
     } else {
       throw new Error("Unexpected AI response format");
     }
@@ -401,6 +433,7 @@ async function handleReview(
     recommendation,
     reviewReq.sha
   );
+  const inlineComments = buildInlineComments(validated.findings);
 
   const response: ReviewResponse = {
     ok: true,
@@ -408,6 +441,7 @@ async function handleReview(
     summary: validated.summary,
     findings: validated.findings,
     commentMd,
+    inlineComments,
     recommendation,
     meta: {
       provider: reviewReq.provider,
