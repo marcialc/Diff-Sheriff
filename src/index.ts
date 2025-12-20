@@ -50,7 +50,7 @@ interface ErrorResponse {
 }
 
 const MAX_DIFF_LENGTH = 60_000;
-const AI_MODEL = "@cf/openai/gpt-oss-120b";
+const AI_MODEL = "@cf/qwen/qwen3-30b-a3b-fp8";
 
 const SYSTEM_PROMPT = `You are Diff-Sheriff, a senior/lead engineer conducting a thorough PR review. Your job is to review code diffs and provide actionable, high-signal feedback.
 
@@ -476,17 +476,18 @@ async function handleReview(
 
   let aiResponseText: string;
   try {
-    const aiInput: Record<string, unknown> = {
-      input: [
+    const aiResponse = await env.AI.run(AI_MODEL, {
+      messages: [
         { role: "system", content: SYSTEM_PROMPT },
         { role: "user", content: strictUserPrompt },
       ],
-      response_format: { type: "json_object" },
-    };
+    });
 
-    const aiResponse = await env.AI.run(AI_MODEL, aiInput as never);
-
-    aiResponseText = getAiResponseText(aiResponse);
+    if (typeof aiResponse === "object" && aiResponse !== null && "response" in aiResponse) {
+      aiResponseText = String((aiResponse as { response: unknown }).response);
+    } else {
+      aiResponseText = getAiResponseText(aiResponse);
+    }
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown AI error";
     return errorResponse(`AI failure: ${message}`, 500);
@@ -498,20 +499,19 @@ async function handleReview(
     validated = validateAiResponse(parsed);
   } catch (err) {
     try {
-      const retryInput: Record<string, unknown> = {
-        input: [
+      const retryResp = await env.AI.run(AI_MODEL, {
+        messages: [
           { role: "system", content: SYSTEM_PROMPT },
           {
             role: "user",
-            content:
-              `${strictUserPrompt}\n\nYour previous response was not valid JSON. Try again and output ONLY valid JSON.`,
+            content: `${strictUserPrompt}\n\nYour previous response was not valid JSON. Try again and output ONLY valid JSON.`,
           },
         ],
-        response_format: { type: "json_object" },
-      };
+      });
 
-      const retryResp = await env.AI.run(AI_MODEL, retryInput as never);
-      const retryText = getAiResponseText(retryResp);
+      const retryText = typeof retryResp === "object" && retryResp !== null && "response" in retryResp
+        ? String((retryResp as { response: unknown }).response)
+        : getAiResponseText(retryResp);
       const parsed = extractJson(retryText);
       validated = validateAiResponse(parsed);
     } catch (retryErr) {
