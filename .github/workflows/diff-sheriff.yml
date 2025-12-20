@@ -1,0 +1,68 @@
+name: Diff-Sheriff Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate unified diff
+        id: diff
+        run: |
+          git fetch --no-tags --prune --depth=1 origin "${{ github.base_ref }}"
+          DIFF="$(git diff --unified=3 "origin/${{ github.base_ref }}"...HEAD)"
+          echo "$DIFF" | head -c 60000 > /tmp/pr.diff
+          echo "saved_diff=/tmp/pr.diff" >> "$GITHUB_OUTPUT"
+
+      - name: Call Diff-Sheriff
+        id: sheriff
+        env:
+          DIFF_SHERIFF_URL: https://diff-sheriff.marcialandres06.workers.dev
+          DIFF_SHERIFF_TOKEN: ${{ secrets.DIFF_SHERIFF_TOKEN }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          DIFF_JSON=$(cat "${{ steps.diff.outputs.saved_diff }}" | jq -Rs .)
+
+          RESPONSE=$(curl -sS -X POST "$DIFF_SHERIFF_URL/review" \
+            -H "Authorization: Bearer $DIFF_SHERIFF_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"diff\": $DIFF_JSON,
+              \"provider\": \"github\",
+              \"repo\": \"${{ github.repository }}\",
+              \"prNumber\": ${{ github.event.pull_request.number }},
+              \"sha\": \"${{ github.event.pull_request.head.sha }}\",
+              \"title\": $(printf %s "$PR_TITLE" | jq -Rs .),
+              \"description\": $(printf %s "$PR_BODY" | jq -Rs .),
+              \"mode\": \"summary\"
+            }")
+
+          echo "$RESPONSE" | jq .
+          echo "response<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$RESPONSE" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Comment on PR with review JSON
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = `Diff-Sheriff review (JSON):\n\n\`\`\`json\n${{ steps.sheriff.outputs.response }}\n\`\`\`\n`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
