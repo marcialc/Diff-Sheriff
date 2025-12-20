@@ -374,8 +374,21 @@ async function handleReview(
       ],
     });
 
-    if (typeof aiResponse === "object" && aiResponse !== null && "response" in aiResponse) {
-      aiResponseText = String((aiResponse as { response: unknown }).response);
+    if (typeof aiResponse === "string") {
+      aiResponseText = aiResponse;
+    } else if (typeof aiResponse === "object" && aiResponse !== null) {
+      const obj = aiResponse as Record<string, unknown>;
+      if ("response" in obj && typeof obj.response === "string") {
+        aiResponseText = obj.response;
+      } else if ("content" in obj && typeof obj.content === "string") {
+        aiResponseText = obj.content;
+      } else if ("text" in obj && typeof obj.text === "string") {
+        aiResponseText = obj.text;
+      } else {
+        // Log the actual structure for debugging
+        console.error("Unknown AI response structure:", JSON.stringify(aiResponse));
+        throw new Error("Unexpected AI response format");
+      }
     } else {
       throw new Error("Unexpected AI response format");
     }
