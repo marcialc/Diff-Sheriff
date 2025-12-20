@@ -27,7 +27,6 @@ interface Finding {
 
 type Recommendation = "approve" | "approve_with_changes" | "request_changes";
 
-// Response from Human
 interface ReviewResponse {
   ok: true;
   reviewId: string;
@@ -61,12 +60,10 @@ Priorities (in order):
 4. Performance — only if clearly impactful
 
 Rules:
-- ONLY comment on actual code changes visible in the diff. Do NOT invent feedback.
-- Do NOT comment on missing PR title, description, or other metadata. Do NOT give process feedback.
+- Only comment on code visible in the diff or its immediate context.
+- Be concise and specific. Avoid nitpicks unless they matter.
 - Do NOT flag GitHub Actions secrets references like \`\${{ secrets.* }}\` as hardcoded secrets.
 - Do NOT comment on code style unless it significantly impacts readability.
-- Be concise and specific. Avoid nitpicks unless they matter.
-- If the diff only contains comments, whitespace, or trivial changes with no functional impact, return an empty findings array.
 - Output ONLY valid JSON matching the schema below. No markdown, no explanations outside JSON.
 
 Severity guide:
@@ -77,7 +74,7 @@ Severity guide:
 
 Output JSON Schema:
 {
-  "summary": "string - 2-4 sentence high-level assessment of the actual code changes",
+  "summary": "string - 2-4 sentence high-level assessment as a senior engineer would write",
   "findings": [
     {
       "severity": "high" | "medium" | "low" | "nit",
@@ -97,41 +94,6 @@ If the diff looks good with no issues, return:
   "findings": [],
   "testingNotes": []
 }`;
-
-function getAiResponseText(aiResponse: unknown): string {
-  if (typeof aiResponse === "string") return aiResponse;
-  if (typeof aiResponse !== "object" || aiResponse === null) {
-    throw new Error("Unexpected AI response format");
-  }
-
-  const obj = aiResponse as Record<string, unknown>;
-
-  if ("response" in obj) {
-    return String(obj.response);
-  }
-  if ("output_text" in obj) {
-    return String(obj.output_text);
-  }
-  if ("output" in obj && Array.isArray(obj.output)) {
-    // Best-effort extraction for Responses API style outputs.
-    // Keep this minimal + defensive; we still require JSON extraction downstream.
-    const chunks: string[] = [];
-    for (const item of obj.output) {
-      if (typeof item !== "object" || item === null) continue;
-      const rec = item as Record<string, unknown>;
-      if (Array.isArray(rec.content)) {
-        for (const c of rec.content) {
-          if (typeof c !== "object" || c === null) continue;
-          const cc = c as Record<string, unknown>;
-          if (typeof cc.text === "string") chunks.push(cc.text);
-        }
-      }
-    }
-    if (chunks.length > 0) return chunks.join("\n");
-  }
-
-  throw new Error("Unexpected AI response format");
-}
 
 function deriveRecommendation(findings: Finding[]): Recommendation {
   const hasHigh = findings.some((f) => f.severity === "high");
@@ -290,49 +252,6 @@ function validateFinding(f: unknown): Finding | null {
   return finding;
 }
 
-const METADATA_NOISE_PATTERNS = [
-  /\bpr\s+title\b/i,
-  /\bpr\s+description\b/i,
-  /\bmissing\s+(title|description|context)\b/i,
-  /\black\s+of\s+(context|description)\b/i,
-  /\bempty\s+(title|description)\b/i,
-  /\bno\s+(title|description|context)\b/i,
-  /\bprovide\s+(a\s+)?(clear\s+)?(title|description)\b/i,
-];
-
-function isMetadataNoiseFinding(finding: Finding): boolean {
-  const text = `${finding.title} ${finding.rationale} ${finding.suggestion || ""}`.toLowerCase();
-  return METADATA_NOISE_PATTERNS.some((pattern) => pattern.test(text));
-}
-
-function filterNonsensicalFindings(findings: Finding[]): Finding[] {
-  return findings.filter((f) => !isMetadataNoiseFinding(f));
-}
-
-function isTrivialDiff(diff: string): boolean {
-  const lines = diff.split("\n");
-  let hasSubstantiveChange = false;
-
-  for (const line of lines) {
-    if (!line.startsWith("+") && !line.startsWith("-")) continue;
-    if (line.startsWith("+++") || line.startsWith("---")) continue;
-
-    const content = line.slice(1).trim();
-    if (!content) continue;
-
-    if (content.startsWith("//") || content.startsWith("#") || content.startsWith("*") || content.startsWith("/*") || content.startsWith("*/")) {
-      continue;
-    }
-
-    if (/^\s*$/.test(content)) continue;
-
-    hasSubstantiveChange = true;
-    break;
-  }
-
-  return !hasSubstantiveChange;
-}
-
 function validateAiResponse(parsed: unknown): {
   summary: string;
   findings: Finding[];
@@ -444,49 +363,21 @@ async function handleReview(
     truncatedDiff = true;
   }
 
-  if (isTrivialDiff(reviewReq.diff)) {
-    const trivialSummary = "Trivial change (comments, whitespace, or non-functional). No issues found.";
-    const trivialCommentMd = renderReviewMarkdown(
-      trivialSummary,
-      [],
-      [],
-      "approve",
-      reviewReq.sha
-    );
-    return jsonResponse({
-      ok: true,
-      reviewId: crypto.randomUUID(),
-      summary: trivialSummary,
-      findings: [],
-      commentMd: trivialCommentMd,
-      recommendation: "approve",
-      meta: {
-        provider: reviewReq.provider,
-        repo: reviewReq.repo,
-        sha: reviewReq.sha,
-        mode: reviewReq.mode || "summary",
-        truncatedDiff,
-      },
-    } satisfies ReviewResponse);
-  }
-
   const userPrompt = buildUserPrompt(reviewReq, truncatedDiff);
-
-  const strictUserPrompt = `${userPrompt}\n\nIMPORTANT: Return ONLY a single valid JSON object (double quotes for keys/strings). No markdown, no code fences, no commentary.`;
 
   let aiResponseText: string;
   try {
     const aiResponse = await env.AI.run(AI_MODEL, {
       messages: [
         { role: "system", content: SYSTEM_PROMPT },
-        { role: "user", content: strictUserPrompt },
+        { role: "user", content: userPrompt },
       ],
     });
 
     if (typeof aiResponse === "object" && aiResponse !== null && "response" in aiResponse) {
       aiResponseText = String((aiResponse as { response: unknown }).response);
     } else {
-      aiResponseText = getAiResponseText(aiResponse);
+      throw new Error("Unexpected AI response format");
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown AI error";
@@ -498,34 +389,14 @@ async function handleReview(
     const parsed = extractJson(aiResponseText);
     validated = validateAiResponse(parsed);
   } catch (err) {
-    try {
-      const retryResp = await env.AI.run(AI_MODEL, {
-        messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          {
-            role: "user",
-            content: `${strictUserPrompt}\n\nYour previous response was not valid JSON. Try again and output ONLY valid JSON.`,
-          },
-        ],
-      });
-
-      const retryText = typeof retryResp === "object" && retryResp !== null && "response" in retryResp
-        ? String((retryResp as { response: unknown }).response)
-        : getAiResponseText(retryResp);
-      const parsed = extractJson(retryText);
-      validated = validateAiResponse(parsed);
-    } catch (retryErr) {
-      const message =
-        retryErr instanceof Error ? retryErr.message : "Failed to parse AI response";
-      return errorResponse(`AI response parsing failed: ${message}`, 500);
-    }
+    const message = err instanceof Error ? err.message : "Failed to parse AI response";
+    return errorResponse(`AI response parsing failed: ${message}`, 500);
   }
 
-  const filteredFindings = filterNonsensicalFindings(validated.findings);
-  const recommendation = deriveRecommendation(filteredFindings);
+  const recommendation = deriveRecommendation(validated.findings);
   const commentMd = renderReviewMarkdown(
     validated.summary,
-    filteredFindings,
+    validated.findings,
     validated.testingNotes,
     recommendation,
     reviewReq.sha
@@ -535,7 +406,7 @@ async function handleReview(
     ok: true,
     reviewId: crypto.randomUUID(),
     summary: validated.summary,
-    findings: filteredFindings,
+    findings: validated.findings,
     commentMd,
     recommendation,
     meta: {
