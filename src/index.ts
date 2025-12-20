@@ -50,7 +50,7 @@ interface ErrorResponse {
 }
 
 const MAX_DIFF_LENGTH = 60_000;
-const AI_MODEL = "@cf/meta/llama-3.1-8b-instruct-fp8";
+const AI_MODEL = "@cf/openai/gpt-oss-120b";
 
 const SYSTEM_PROMPT = `You are Diff-Sheriff, a senior/lead engineer conducting a thorough PR review. Your job is to review code diffs and provide actionable, high-signal feedback.
 
@@ -97,6 +97,41 @@ If the diff looks good with no issues, return:
   "findings": [],
   "testingNotes": []
 }`;
+
+function getAiResponseText(aiResponse: unknown): string {
+  if (typeof aiResponse === "string") return aiResponse;
+  if (typeof aiResponse !== "object" || aiResponse === null) {
+    throw new Error("Unexpected AI response format");
+  }
+
+  const obj = aiResponse as Record<string, unknown>;
+
+  if ("response" in obj) {
+    return String(obj.response);
+  }
+  if ("output_text" in obj) {
+    return String(obj.output_text);
+  }
+  if ("output" in obj && Array.isArray(obj.output)) {
+    // Best-effort extraction for Responses API style outputs.
+    // Keep this minimal + defensive; we still require JSON extraction downstream.
+    const chunks: string[] = [];
+    for (const item of obj.output) {
+      if (typeof item !== "object" || item === null) continue;
+      const rec = item as Record<string, unknown>;
+      if (Array.isArray(rec.content)) {
+        for (const c of rec.content) {
+          if (typeof c !== "object" || c === null) continue;
+          const cc = c as Record<string, unknown>;
+          if (typeof cc.text === "string") chunks.push(cc.text);
+        }
+      }
+    }
+    if (chunks.length > 0) return chunks.join("\n");
+  }
+
+  throw new Error("Unexpected AI response format");
+}
 
 function deriveRecommendation(findings: Finding[]): Recommendation {
   const hasHigh = findings.some((f) => f.severity === "high");
@@ -440,17 +475,13 @@ async function handleReview(
   let aiResponseText: string;
   try {
     const aiResponse = await env.AI.run(AI_MODEL, {
-      messages: [
+      input: [
         { role: "system", content: SYSTEM_PROMPT },
         { role: "user", content: userPrompt },
       ],
     });
 
-    if (typeof aiResponse === "object" && aiResponse !== null && "response" in aiResponse) {
-      aiResponseText = String((aiResponse as { response: unknown }).response);
-    } else {
-      throw new Error("Unexpected AI response format");
-    }
+    aiResponseText = getAiResponseText(aiResponse);
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown AI error";
     return errorResponse(`AI failure: ${message}`, 500);
