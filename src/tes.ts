@@ -1,2 +1,2 @@
 
-const add = (a: number, b: number) => a - b;
+const add = (a: number, b: string) => a + +b;
